@@ -20,40 +20,51 @@ package net.raphimc.javadowngrader.gradle.task;
 import net.lenni0451.classtransform.TransformerManager;
 import net.lenni0451.classtransform.additionalclassprovider.LazyFileClassProvider;
 import net.lenni0451.classtransform.additionalclassprovider.PathClassProvider;
+import net.lenni0451.classtransform.utils.log.impl.SysoutLogger;
 import net.lenni0451.classtransform.utils.tree.BasicClassProvider;
 import net.raphimc.javadowngrader.impl.classtransform.JavaDowngraderTransformer;
-import net.raphimc.javadowngrader.impl.classtransform.util.ClassNameUtil;
 import net.raphimc.javadowngrader.runtime.RuntimeRoot;
 import org.gradle.api.DefaultTask;
 import org.gradle.api.file.ConfigurableFileCollection;
 import org.gradle.api.file.RegularFileProperty;
+import org.gradle.api.file.RelativePath;
+import org.gradle.api.internal.file.copy.CopyAction;
+import org.gradle.api.internal.file.copy.CopyActionProcessingStream;
+import org.gradle.api.internal.file.copy.FileCopyDetailsInternal;
 import org.gradle.api.provider.Property;
 import org.gradle.api.tasks.Input;
 import org.gradle.api.tasks.InputFile;
 import org.gradle.api.tasks.InputFiles;
 import org.gradle.api.tasks.TaskAction;
+import org.gradle.api.tasks.WorkResults;
+import org.gradle.api.tasks.bundling.AbstractArchiveTask;
 import org.objectweb.asm.Opcodes;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.io.UncheckedIOException;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.nio.file.*;
+import java.util.ArrayDeque;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.Map;
+import java.util.Queue;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Stream;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
 
-public abstract class DowngradeJarTask extends DefaultTask {
-
-    @InputFile
-    public abstract RegularFileProperty getInput();
-
-    @Input
-    public abstract Property<String> getOutputSuffix();
-
+public abstract class DowngradeJarTask extends AbstractArchiveTask {
     @InputFiles
     public abstract ConfigurableFileCollection getCompileClassPath();
 
@@ -64,68 +75,93 @@ public abstract class DowngradeJarTask extends DefaultTask {
     public abstract Property<Boolean> getCopyRuntimeClasses();
 
     public DowngradeJarTask() {
-        getOutputSuffix().convention("-downgraded");
+        getArchiveClassifier().convention("-downgraded");
+        getArchiveExtension().convention("jar");
+        getDestinationDirectory().set(getProject().getLayout().getBuildDirectory().dir("libs"));
         getTargetVersion().convention(Opcodes.V1_8);
         getCopyRuntimeClasses().convention(true);
     }
 
-    @TaskAction
-    public void run() throws IOException, URISyntaxException {
-        final File inputFile = getInput().getAsFile().get();
-        System.out.println("Downgrading jar: " + inputFile);
+    @Override
+    protected CopyAction createCopyAction() {
+        return (CopyActionProcessingStream caps) -> {
+            final Map<String, FileCopyDetailsInternal> fileDetails = new LinkedHashMap<>();
+            final Map<String, byte[]> rawData = new HashMap<>();
+            final Set<String> directories = new HashSet<>();
+            final AtomicBoolean doneProcessing = new AtomicBoolean();
 
-        try (FileSystem inFs = FileSystems.newFileSystem(inputFile.toPath(), (ClassLoader) null)) {
-            final Path inRoot = inFs.getRootDirectories().iterator().next();
+            caps.process((file) -> {
+                if (doneProcessing.get()) {
+                    throw new IllegalStateException("processFile called after the process call. This hints towards synchronization issues");
+                }
 
-            final Collection<String> runtimeDeps = new HashSet<>();
+                if (fileDetails.putIfAbsent(file.getRelativePath().getPathString(), file) != null) {
+                    throw new IllegalStateException("Duplicate entry: '" + file.getRelativePath().getPathString() + "' (Note: duplicate file handling strategies are not yet implemented)");
+                }
+
+                if (!file.isDirectory()) {
+                    long len = file.getSize();
+                    ByteArrayOutputStream baos;
+                    if (len <= 0 || len > (1 << 28)) { // We surmise that the provided length cannot be trusted here (1 << 28 = 256MiB)
+                        baos = new ByteArrayOutputStream();
+                    } else {
+                        baos = new ByteArrayOutputStream((int) len);
+                    }
+
+                    file.copyTo(baos);
+                    rawData.put(file.getRelativePath().getPathString(), baos.toByteArray());
+                }
+
+                RelativePath ownerDir = file.getRelativePath().getParent();
+                while (ownerDir != null && directories.add(ownerDir.getPathString())) {
+                    ownerDir = ownerDir.getParent();
+                }
+            });
+
+            doneProcessing.set(true);
+
+            final Collection<String> runtimeDeps = new LinkedHashSet<>();
             final TransformerManager transformerManager = new TransformerManager(
-                    new PathClassProvider(inRoot, new LazyFileClassProvider(getCompileClassPath().getFiles(), new BasicClassProvider()))
+                    new FileCopyDetailsClassProvider(fileDetails, rawData)
             );
             transformerManager.addBytecodeTransformer(
                     JavaDowngraderTransformer.builder(transformerManager)
                             .targetVersion(getTargetVersion().get())
-                            .classFilter(c -> Files.isRegularFile(inRoot.resolve(ClassNameUtil.toClassFilename(c))))
                             .depCollector(runtimeDeps::add)
                             .build()
             );
 
-            final String outputName = inputFile.getName().substring(0, inputFile.getName().length() - 4) + getOutputSuffix().get();
-            final File outputFile = new File(inputFile.getParentFile(), outputName + ".jar");
+            try (OutputStream rawOut = Files.newOutputStream(this.getArchiveFile().get().getAsFile().toPath(), StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+                    ZipOutputStream zipOut = new ZipOutputStream(rawOut)) {
+                for (Map.Entry<String, FileCopyDetailsInternal> fileMapEntry : fileDetails.entrySet()) {
+                    String path = fileMapEntry.getKey();
+                    FileCopyDetailsInternal file = fileMapEntry.getValue();
 
-            try (FileSystem outFs = FileSystems.newFileSystem(new URI("jar:" + outputFile.toURI()), Collections.singletonMap("create", "true"))) {
-                final Path outRoot = outFs.getRootDirectories().iterator().next();
+                    if (file.isDirectory() && (file.isIncludeEmptyDirs() || directories.contains(path))) {
+                        final ZipEntry entry = new ZipEntry(path + "/");
+                        zipOut.putNextEntry(entry);
+                        zipOut.closeEntry();
+                    } else {
+                        final ZipEntry entry = new ZipEntry(path);
+                        zipOut.putNextEntry(entry);
 
-                // Downgrade classes
-                try (Stream<Path> stream = Files.walk(inRoot)) {
-                    stream.forEach(path -> {
-                        try {
-                            final String relative = ClassNameUtil.slashName(inRoot.relativize(path));
-                            final Path dest = outRoot.resolve(relative);
-                            if (Files.isDirectory(path)) {
-                                Files.createDirectories(dest);
-                                return;
-                            }
-                            final Path parent = dest.getParent();
-                            if (parent != null) {
-                                Files.createDirectories(parent);
-                            }
-                            if (!relative.endsWith(".class") || relative.contains("META-INF/versions/")) {
-                                Files.copy(path, dest, StandardCopyOption.REPLACE_EXISTING);
-                                return;
-                            }
-                            final String className = ClassNameUtil.toClassName(relative);
-                            final byte[] bytecode = Files.readAllBytes(path);
-                            final byte[] result;
-                            try {
-                                result = transformerManager.transform(className, bytecode);
-                            } catch (Throwable e) {
-                                throw new RuntimeException("Failed to transform " + className, e);
-                            }
-                            Files.write(dest, result != null ? result : bytecode);
-                        } catch (IOException e) {
-                            throw new UncheckedIOException(e);
+                        if (!path.endsWith(".class") || path.contains("META-INF/versions/")) {
+                            zipOut.write(rawData.get(path));
+                            zipOut.closeEntry();
+                            continue;
                         }
-                    });
+
+                        final byte[] result;
+                        try {
+                            final String className = path.substring(0, path.length() - 6).replace('/', '.');
+                            result = transformerManager.transform(className, rawData.get(path));
+                        } catch (Throwable e2) {
+                            throw new RuntimeException("Failed to transform '" + path + "'", e2);
+                        }
+
+                        zipOut.write(result);
+                        zipOut.closeEntry();
+                    }
                 }
 
                 // Copy runtime classes
@@ -136,17 +172,39 @@ public abstract class DowngradeJarTask extends DefaultTask {
                             if (is == null) {
                                 throw new IllegalStateException("Missing runtime class " + runtimeDep);
                             }
-                            final Path dest = outRoot.resolve(classPath);
-                            final Path parent = dest.getParent();
-                            if (parent != null) {
-                                Files.createDirectories(parent);
+
+                            final Path dest = Paths.get(classPath);
+                            Path directory = dest.getParent();
+                            Queue<String> directoryQueue = Collections.asLifoQueue(new ArrayDeque<>());
+
+                            while (directory != null && !directories.contains(directory.toString())) {
+                                directoryQueue.add(directory.toString());
+                                directories.add(directory.toString());
+                                directory = directory.getParent();
                             }
-                            Files.copy(is, dest, StandardCopyOption.REPLACE_EXISTING);
+
+                            while (!directoryQueue.isEmpty()) {
+                                final ZipEntry entry = new ZipEntry(directoryQueue.poll() + "/");
+                                zipOut.putNextEntry(entry);
+                                zipOut.closeEntry();
+                            }
+
+                            zipOut.putNextEntry(new ZipEntry(classPath));
+                            byte[] buffer = new byte[4096];
+                            for (int read = is.read(buffer); read >= 0; read = is.read(buffer)) {
+                                if (read != 0) {
+                                    zipOut.write(buffer, 0, read);
+                                }
+                            }
+                            zipOut.closeEntry();
                         }
                     }
                 }
+            } catch (IOException e) {
+                throw new RuntimeException(e);
             }
-        }
-    }
 
+            return WorkResults.didWork(true);
+        };
+    }
 }

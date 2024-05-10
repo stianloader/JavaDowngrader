@@ -61,19 +61,19 @@ classes.finalizedBy("java8Main")
 
 ### Downgrade the built jar (If you use Java 8+ libraries)
 ```groovy
-import net.raphimc.javadowngrader.gradle.task.DowngradeJarTask
-
-tasks.register("java8Jar", DowngradeJarTask) {
-    input = tasks.jar.archiveFile.get().asFile
-    outputSuffix = "+java8"
+task downgradedJar(type: net.raphimc.javadowngrader.gradle.task.DowngradeJarTask, dependsOn: jar) {
+    from(zipTree(jar.archiveFile))
+    archiveClassifier = "j8"
     compileClassPath = sourceSets.main.compileClasspath
-}.get().dependsOn("build")
-build.finalizedBy("java8Jar")
+}
+
+build {
+    dependsOn("downgradedJar")
+}
 ```
 
 Some of the optional properties include:
 - ``targetVersion``: The target classfile version (Default: 8)
-- ``outputSuffix``: The suffix to append to the output jar file (Default: "-downgraded")
 - ``copyRuntimeClasses``: Whether to copy the JavaDowngrader runtime classes to the output jar (Default: true). Should be set to false if your jar already contains JavaDowngrader itself
 
 ## Usage (In Maven)
